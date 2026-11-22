@@ -40,9 +40,22 @@ param(
     [switch]$TestReboot,
     [switch]$TestClick,
     [switch]$KeepConsole,
+    [string]$SimKeys = '',
     [int]$KeepDays = 3,
     [int]$LaunchTimeout = 120
 )
+
+# 调试用：-SimKeys 预置按键（s=空格、e=回车、x=其它键），仅配合 -TestReboot 验证倒计时逻辑
+$script:SimKeysQueue = @()
+if ($SimKeys) {
+    foreach ($ch in $SimKeys.ToCharArray()) {
+        switch ($ch) {
+            's' { $script:SimKeysQueue += 32 }
+            'e' { $script:SimKeysQueue += 13 }
+            'x' { $script:SimKeysQueue += 65 }
+        }
+    }
+}
 
 $ScriptDir = Split-Path -Parent $PSCommandPath
 $script:LogFile = Join-Path $ScriptDir 'hs-fix-log.txt'
@@ -311,6 +324,40 @@ function Test-GameAlive {
 }
 function Get-ZombieGame {
     return @(Get-GameProcs | Where-Object { $_.Mem -lt (20MB) -and -not $_.HasWindow })
+}
+# 用 SYSTEM 身份的临时计划任务去 taskkill：内核挂起的进程有时只有 SYSTEM 能收掉
+function Invoke-SystemKill([int[]]$TargetPids) {
+    $list = @($TargetPids | Where-Object { $_ -gt 0 })
+    if ($list.Count -eq 0) { return $false }
+    if (-not $isAdmin) { Log '  [SYSTEM 强杀] 当前不是管理员，跳过。'; return $false }
+    $sys32 = Join-Path $env:SystemRoot 'System32'
+    $taskkillExe = Join-Path $sys32 'taskkill.exe'
+    $schtasksExe = Join-Path $sys32 'schtasks.exe'
+    foreach ($tp in $list) {
+        $tn = 'HearthstoneFix_Kill_' + $tp
+        $arg = ('/F /T /PID ' + $tp)
+        try {
+            $action = New-ScheduledTaskAction -Execute $taskkillExe -Argument $arg
+            $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+            Register-ScheduledTask -TaskName $tn -Action $action -Principal $principal -Force -ErrorAction Stop | Out-Null
+            Start-ScheduledTask -TaskName $tn -ErrorAction Stop
+            Log ('  [SYSTEM 强杀] 已提交 PID {0} 的结束请求（SYSTEM 身份）' -f $tp)
+        } catch {
+            try {
+                & $schtasksExe /Create /TN $tn /TR ('"' + $taskkillExe + '" ' + $arg) /SC ONCE /ST 23:59 /RU SYSTEM /RL HIGHEST /F 2>&1 | Out-Null
+                & $schtasksExe /Run /TN $tn 2>&1 | Out-Null
+                Log ('  [SYSTEM 强杀] 已提交 PID {0} 的结束请求（schtasks 方式）' -f $tp)
+            } catch {
+                Log ('  [SYSTEM 强杀] PID {0} 提交失败：{1}' -f $tp, $_.Exception.Message)
+                continue
+            }
+        }
+        Start-Sleep -Seconds 4
+        & $schtasksExe /Delete /TN $tn /F 2>&1 | Out-Null
+    }
+    Start-Sleep -Seconds 2
+    $left = @(Get-ZombieGame | Where-Object { $list -contains $_.Pid })
+    return ($left.Count -eq 0)
 }
 
 # ================= 战网界面：窗口控制 + 截图 + 按钮识别 =================
@@ -611,25 +658,70 @@ function Show-CrashEvidence {
           Where-Object { $_.Message -match 'Hearthstone' -and $_.Id -eq 1000 } | Select-Object -First 1
     if ($ev) { Log ('  最近崩溃: ' + (($ev.Message -split "`n")[1..2] -join ' / ')) }
 }
-# 询问并执行重启：空格 / 回车 = 确认，其余键 = 取消
+# 询问并执行重启：空格 / 回车 = 确认，倒计时中再按可每次提前 1 秒，其它键 = 取消
+function Get-KeyCode {
+    # 非阻塞取一个按键码；0 表示当前没有按键
+    if ($script:SimKeysQueue.Count -gt 0) {
+        $c = $script:SimKeysQueue[0]
+        $script:SimKeysQueue = @($script:SimKeysQueue | Select-Object -Skip 1)
+        return [int]$c
+    }
+    try {
+        if ([Console]::KeyAvailable) {
+            $k = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+            return [int]$k.VirtualKeyCode
+        }
+    } catch {}
+    return 0
+}
 function Invoke-RebootAsk([int]$Countdown = 8) {
     Log ''
     Log '  是否立即重启电脑来清除这些卡死进程？'
     Log '    注意：重启会关闭所有程序，未保存的工作会丢失。'
-    Log '    按 [空格] 或 [回车] 确认并重启；按其他键取消（只退出，不重启）'
+    Log '    按 [空格] 或 [回车] 确认；按其他键取消（只退出，不重启）'
     $confirm = $false
-    try {
-        $key = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
-        $confirm = ($key.VirtualKeyCode -eq 32 -or $key.VirtualKeyCode -eq 13)
-    } catch {
-        Log ('  [提示] 当前窗口无法直接读按键（' + $_.Exception.Message + '），改用回车确认。')
+    if ([Console]::IsInputRedirected -and $script:SimKeysQueue.Count -eq 0) {
         $ans = Read-Host '    输入 y 后回车确认重启，直接回车或其它字符取消'
         $confirm = ($ans -eq 'y' -or $ans -eq 'Y')
+    } else {
+        $deadline = (Get-Date).AddSeconds(60)
+        while ((Get-Date) -lt $deadline) {
+            $code = Get-KeyCode
+            if ($code -ne 0) {
+                if ($code -eq 32 -or $code -eq 13) { $confirm = $true }
+                break
+            }
+            Start-Sleep -Milliseconds 150
+        }
     }
     if (-not $confirm) { Log '  已取消重启。'; return 'cancel' }
-    if ($TestReboot) { Log '  [测试] 已命中"确认重启"分支（测试模式不真的重启）'; return 'cancel' }
-    Log ('  即将重启，倒计时 {0} 秒（按 Ctrl+C 可中止）...' -f $Countdown)
-    for ($i = $Countdown; $i -ge 1; $i--) { Write-Host ('    ' + $i); Start-Sleep -Seconds 1 }
+    Log ('  开始重启倒计时 {0} 秒：再按 [空格] / [回车] 可每次提前 1 秒，按其它键取消...' -f $Countdown)
+    $remain = $Countdown
+    while ($remain -gt 0) {
+        Write-Host ('    剩余 {0} 秒' -f $remain)
+        $elapsed = 0
+        $pressed = $false
+        while ($elapsed -lt 1000 -and -not $pressed -and $remain -gt 0) {
+            $code = Get-KeyCode
+            if ($code -ne 0) {
+                if ($code -eq 32 -or $code -eq 13) {
+                    $remain--
+                    $pressed = $true
+                    Log ('  [提前] 已加速 1 秒，剩余 {0} 秒' -f ([Math]::Max($remain, 0)))
+                } else {
+                    Log '  已取消重启。'
+                    return 'cancel'
+                }
+            }
+            Start-Sleep -Milliseconds 100
+            $elapsed += 100
+        }
+        if (-not $pressed -and $remain -gt 0) { $remain-- }
+    }
+    if ($TestReboot) {
+        Log '  [测试] 倒计时结束，已命中"执行重启"分支（测试模式不真的重启）'
+        return 'cancel'
+    }
     Log '  正在重启...'
     $ok = $false
     try {
@@ -683,7 +775,15 @@ if (-not $DryRun -and $killed -eq 0) { Log '  没有需要结束的进程' }
 $zombies = Get-ZombieGame
 if (@($zombies).Count -gt 0) {
     Log ('  发现卡死的炉石残留: ' + (@($zombies | ForEach-Object { 'PID=' + $_.Pid + '(' + [int]($_.Mem / 1KB) + 'KB)' }) -join ' '))
-    if (-not $DryRun) { Kill-Game; Start-Sleep -Seconds 2; $zombies = Get-ZombieGame }
+    if (-not $DryRun) {
+        Kill-Game; Start-Sleep -Seconds 2; $zombies = Get-ZombieGame
+        if (@($zombies).Count -gt 0) {
+            Log '  普通结束无效，改用 SYSTEM 身份再试一次（这一步不重启也有机会清掉）...'
+            $null = Invoke-SystemKill @($zombies | ForEach-Object { $_.Pid })
+            $zombies = Get-ZombieGame
+            if (@($zombies).Count -eq 0) { Log '  [已清除] SYSTEM 强杀成功，无需重启，继续自动启动。' }
+        }
+    }
     if (@($zombies).Count -gt 0) {
         Log '  [阻断] 这些进程卡死在内核里，普通结束和提权结束都无效（Access denied）。'
         Log '         它们会让战网一直显示"正在游戏中"，从而导致游戏无法被自动拉起。'
@@ -693,9 +793,9 @@ if (@($zombies).Count -gt 0) {
             elseif ($rb -eq 'cancel') { Log ''; Log '=== 已取消：未重启，按需再双击运行 ==='; Finish 2 }
             else { Log ''; Log '=== 自动重启失败：请手动重启电脑后重试 ==='; Finish 3 }
         } else {
-            Log '         >>> （预览模式）实际执行时会提示你按键，确认后自动重启。'
+            Log '         >>> （预览模式）实际执行时会尝试 SYSTEM 强杀，仍失败才提示按键重启。'
         }
-    } else { Log '  [已清除] 卡死残留已结束' }
+    }
 }
 Log ''
 
