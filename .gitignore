@@ -1,2 +1,3 @@
 hs-fix-log.txt
 *.log
+build/*.exe

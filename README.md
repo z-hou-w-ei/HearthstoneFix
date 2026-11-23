@@ -99,7 +99,15 @@
 
 ## 三、使用方法
 
-### 快速开始
+### 方式一：单文件 exe（最简单）
+
+到 [Releases](https://github.com/z-hou-w-ei/HearthstoneFix/releases) 下载 `HearthstoneFix.exe`，双击即可（会弹 UAC，点「是」）。
+
+- 首次运行会把脚本自动释放到 `%LOCALAPPDATA%\HearthstoneFix\`，并在桌面创建「炉石一键修复」快捷方式；之后点桌面图标就行；
+- 要改路径配置，编辑 `%LOCALAPPDATA%\HearthstoneFix\config.ini`；运行日志是同目录的 `hs-fix-log.txt`；
+- 想彻底卸载：删掉桌面快捷方式和 `%LOCALAPPDATA%\HearthstoneFix` 文件夹即可，不写注册表、不留后台服务。
+
+### 方式二：解压版（源码 / 想自己改脚本）
 
 1. 把整个 `HearthstoneFix-main` 文件夹放到任意位置（从 GitHub 下载 zip 解压即可，**不要只拷贝 bat 一个文件**）；
 2. 双击 `一键修复.bat`。**会自动弹出 UAC 请求管理员权限，点「是」**——脚本需要管理员才能重启战网后台服务、用 SYSTEM 身份强杀卡死进程。同时第一次运行会在桌面创建带炉石图标的「炉石一键修复」快捷方式，以后直接点桌面图标即可（同样会弹 UAC）；
@@ -217,10 +225,14 @@ HearthstoneFix-main/                 # GitHub 下载 zip 解压后的目录名�
 ├── HearthstoneFix.ps1              # 主脚本（UTF-8 带 BOM）
 ├── config.ini                      # 可选路径覆盖，默认全部注释
 ├── README.md                       # 本说明文档
-├── .gitignore                      # 忽略运行日志
+├── .gitignore                      # 忽略运行日志与打包产物
 ├── hs-fix-log.txt                  # 运行日志（每次运行覆盖，不入库）
-└── icon/
-    └── HearthstoneFix.ico          # 桌面快捷方式图标
+├── icon/
+│   └── HearthstoneFix.ico          # 桌面快捷方式 / exe 图标
+└── build/                          # 单文件 exe 的打包工程
+    ├── launcher.cs                 #   启动器：内嵌资源，释放后拉起 bat
+    ├── build.ps1                   #   一键编译（调用系统自带 csc.exe）
+    └── HearthstoneFix.exe          #   编译产物（Release 附件，不打进源码库）
 ```
 
 ### `config.ini` 可选填法
