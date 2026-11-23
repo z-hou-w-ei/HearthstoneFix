@@ -81,7 +81,18 @@ function Ensure-Shortcut {
     $lnkPath = Join-Path $desktop $lnkName
     $batPath = Join-Path $ScriptDir '一键修复.bat'
     $icoPath = Join-Path $ScriptDir 'icon\HearthstoneFix.ico'
-    if (Test-Path -LiteralPath $lnkPath) { return $true }
+    if (Test-Path -LiteralPath $lnkPath) {
+        # 已存在：如果指向的正是本目录的 bat，就不动；指向别处（比如旧的解压目录）则改指到当前目录
+        try {
+            $ex = (New-Object -ComObject WScript.Shell).CreateShortcut($lnkPath)
+            $tgt = $ex.TargetPath
+            if ($tgt) {
+                $tgtDir = Split-Path -Parent $tgt
+                if ($tgtDir -eq $ScriptDir -and (Test-Path -LiteralPath $tgt)) { return $true }
+                Log ('  [快捷方式] 已有快捷方式指向 ' + $tgt + '，改为指向当前目录')
+            }
+        } catch {}
+    }
     if (-not (Test-Path -LiteralPath $batPath)) { Log '  [快捷方式] 找不到 一键修复.bat，跳过。'; return $false }
     try {
         $wsh = New-Object -ComObject WScript.Shell

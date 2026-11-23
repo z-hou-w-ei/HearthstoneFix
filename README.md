@@ -104,6 +104,7 @@
 到 [Releases](https://github.com/z-hou-w-ei/HearthstoneFix/releases) 下载 `HearthstoneFix.exe`，双击即可（会弹 UAC，点「是」）。
 
 - 首次运行会把脚本自动释放到 `%LOCALAPPDATA%\HearthstoneFix\`，并在桌面创建「炉石一键修复」快捷方式；之后点桌面图标就行；
+- 如果桌面上已经有旧的「炉石一键修复」快捷方式（指向别的解压目录），首次运行会自动把它改成指向本次释放的目录；
 - 要改路径配置，编辑 `%LOCALAPPDATA%\HearthstoneFix\config.ini`；运行日志是同目录的 `hs-fix-log.txt`；
 - 想彻底卸载：删掉桌面快捷方式和 `%LOCALAPPDATA%\HearthstoneFix` 文件夹即可，不写注册表、不留后台服务。
 
