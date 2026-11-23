@@ -101,11 +101,13 @@
 
 ### 快速开始
 
-1. 把整个 `HearthstoneFix` 文件夹放到任意位置；
-2. 双击 `一键修复.bat`；
+1. 把整个 `HearthstoneFix-main` 文件夹放到任意位置（从 GitHub 下载 zip 解压即可，**不要只拷贝 bat 一个文件**）；
+2. 双击 `一键修复.bat`（第一次运行会自动在桌面创建带炉石图标的「炉石一键修复」快捷方式，之后从桌面点它更方便）；
 3. 完成后窗口自动关闭；出问题时看同目录 `hs-fix-log.txt`。
 
-第一次在新电脑上运行，脚本会自动探测战网、炉石、盒子的安装位置，一般不需要改任何配置。
+第一次在新电脑上运行，脚本会自动探测战网、炉石、盒子的安装位置，一般不需要改任何配置。若日志里出现某一项“未找到”，在 `config.ini` 里填上真实路径即可。
+
+> 如果双击 bat 只闪过一句 `'l' is not recognized as an internal or external command`，说明 bat 的换行格式被破坏了（Windows 的 cmd 需要 CRLF）。本项目仓库里的 bat 已经是 CRLF + GBK，正常下载解压不会出这个问题；用记事本另存、或用某些工具转码会破坏它，重新解压一份即可。脚本本身也已改成不依赖括号块的写法，即便换行被改坏也能跑起来。
 
 ### 命令行参数
 
@@ -188,7 +190,7 @@
 | --- | --- | --- | --- |
 | 1 | `config.ini` 手填 | `config.ini` 手填 | `config.ini` 手填 |
 | 2 | 战网 `%APPDATA%\Battle.net\Battle.net.config` 里的 `"Path"` 字段 | 卸载注册表项 `InstallLocation` / `DisplayIcon` | 卸载注册表项 |
-| 3 | 正在运行的 `Battle.net` 进程真实路径 | 正在运行的 `Hearthstone` 进程路径 | 正在运行的 `HSAng` 进程路径 |
+| 3 | 正在运行的 `Battle.net` 进程真实路径 | 正在运行的 `Hearthstone` 进程路径；**战网目录内的 `Hearthstone\Hearthstone.exe`（战网内置安装，如 `I:\Battle.net\Hearthstone\`）** | 正在运行的 `HSAng` 进程路径 |
 | 4 | 开始菜单 / 桌面快捷方式 | 快捷方式（国服多指向 `Hearthstone Beta Launcher.exe`，自动取同目录主程序） | 快捷方式（自动排除 Uninstall 项） |
 | 5 | 卸载注册表项 / Blizzard `InstallPath` | 各盘常见目录 | 各盘常见目录 |
 | 6 | 各盘常见目录 | 浅层全盘搜索（深度 4，限时 30 秒） | 浅层全盘搜索（限时 20 秒） |
@@ -205,8 +207,8 @@
 ## 六、文件结构
 
 ```
-HearthstoneFix/
-├── 一键修复.bat                    # 入口：调用 PowerShell，按返回码决定是否关窗（CRLF + GBK）
+HearthstoneFix-main/                 # GitHub 下载 zip 解压后的目录名，可随意放
+├── 一键修复.bat                    # 入口：调用 PowerShell，按返回码决定是否关窗（CRLF + GBK，勿用记事本另存）
 ├── HearthstoneFix.ps1              # 主脚本（UTF-8 带 BOM）
 ├── config.ini                      # 可选路径覆盖，默认全部注释
 ├── README.md                       # 本说明文档

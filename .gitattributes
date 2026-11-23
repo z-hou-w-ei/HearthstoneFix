@@ -1,1 +1,4 @@
 *.bat -text
+*.ps1 -text
+*.md -text
+*.ini -text

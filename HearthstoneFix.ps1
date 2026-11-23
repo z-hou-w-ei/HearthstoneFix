@@ -26,6 +26,9 @@
     .\一键修复.bat -LaunchTimeout 180 等待游戏窗口秒数（默认 120）
     .\一键修复.bat -TestClick         只测试按钮识别与点击
     .\一键修复.bat -KeepConsole       点击时不最小化命令行窗口（调试用）
+    .\一键修复.bat -NoShortcut        跳过“首次运行自动创建桌面快捷方式”
+  说明：第一次真实运行（非 -DryRun）时，会在桌面创建「炉石一键修复」快捷方式，
+        图标使用本目录 icon\HearthstoneFix.ico；已存在则不动。
 #>
 [CmdletBinding()]
 param(
@@ -40,6 +43,7 @@ param(
     [switch]$TestReboot,
     [switch]$TestClick,
     [switch]$KeepConsole,
+    [switch]$NoShortcut,
     [string]$SimKeys = '',
     [int]$KeepDays = 3,
     [int]$LaunchTimeout = 120
@@ -68,6 +72,34 @@ function Log($m) {
     }
 }
 function Finish([int]$Code) { exit $Code }
+
+# 首次运行时把快捷方式建到桌面（图标用项目自带的 icon\HearthstoneFix.ico）
+function Ensure-Shortcut {
+    $lnkName = '炉石一键修复.lnk'
+    $desktop = [Environment]::GetFolderPath('Desktop')
+    if (-not $desktop) { Log '  [快捷方式] 取不到桌面路径，跳过。'; return $false }
+    $lnkPath = Join-Path $desktop $lnkName
+    $batPath = Join-Path $ScriptDir '一键修复.bat'
+    $icoPath = Join-Path $ScriptDir 'icon\HearthstoneFix.ico'
+    if (Test-Path -LiteralPath $lnkPath) { return $true }
+    if (-not (Test-Path -LiteralPath $batPath)) { Log '  [快捷方式] 找不到 一键修复.bat，跳过。'; return $false }
+    try {
+        $wsh = New-Object -ComObject WScript.Shell
+        $lnk = $wsh.CreateShortcut($lnkPath)
+        $lnk.TargetPath = $batPath
+        $lnk.WorkingDirectory = $ScriptDir
+        $lnk.Description = '炉石一键修复：清理卡死残留并自动启动战网、炉石与盒子'
+        if (Test-Path -LiteralPath $icoPath) { $lnk.IconLocation = $icoPath + ',0' }
+        $lnk.WindowStyle = 1
+        $lnk.Save()
+        Log ('  [快捷方式] 已在桌面创建：' + $lnkPath)
+        return $true
+    } catch {
+        Log ('  [快捷方式] 创建失败：' + $_.Exception.Message)
+        return $false
+    }
+}
+
 function Human($bytes) {
     if ($bytes -ge 1GB) { return ('{0:N2} GB' -f ($bytes / 1GB)) }
     if ($bytes -ge 1MB) { return ('{0:N1} MB' -f ($bytes / 1MB)) }
@@ -223,6 +255,13 @@ function Resolve-Paths {
             $rk = 'HKLM:\SOFTWARE\WOW6432Node\Blizzard Entertainment\Hearthstone'
             $ip = (Get-ItemProperty -Path $rk -Name 'InstallLocation' -ErrorAction SilentlyContinue).InstallLocation
             if ($ip) { $hs = Find-ExeUnder $ip 'Hearthstone.exe' 1 }
+        }
+        # 3.25 战网目录内的炉石：战网“内置安装”时炉石不在独立目录，而在 <战网目录>\Hearthstone 下
+        if (-not $hs -and (Test-ExePath $cfg.BattleNetExe)) {
+            $bnDir = Split-Path -Parent $cfg.BattleNetExe
+            $bnParent = Split-Path -Parent $bnDir
+            if ($bnDir) { $hs = Find-ExeUnder $bnDir 'Hearthstone.exe' 2 }
+            if (-not $hs -and $bnParent) { $hs = Test-ExePath (Join-Path $bnParent 'Hearthstone\Hearthstone.exe') }
         }
         if (-not $hs) {
             foreach ($d in @(Get-DriveRoots)) {
@@ -740,6 +779,7 @@ function Invoke-RebootAsk([int]$Countdown = 8) {
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 Log ('模式: ' + $(if ($DryRun) { '预览' } else { '执行' }) + '   管理员: ' + $(if ($isAdmin) { '有' } else { '无' }))
 Log ''
+if (-not $DryRun -and -not $NoShortcut) { $null = Ensure-Shortcut }
 
 if ($TestReboot) {
     Log '=== 测试模式：仅验证按键与重启询问 ==='
