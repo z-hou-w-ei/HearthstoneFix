@@ -1,3 +1,5 @@
 hs-fix-log.txt
+hs-diag-log.txt
 *.log
 build/*.exe
+/HearthstoneFix.exe

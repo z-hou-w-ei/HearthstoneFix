@@ -27,6 +27,7 @@
     .\一键修复.bat -TestClick         只测试按钮识别与点击
     .\一键修复.bat -KeepConsole       点击时不最小化命令行窗口（调试用）
     .\一键修复.bat -NoShortcut        跳过“首次运行自动创建桌面快捷方式”
+    .\一键修复.bat -DiagOnly          卡死时只采集现场证据，不结束任何进程（分析用）
   说明：第一次真实运行（非 -DryRun）时，会在桌面创建「炉石一键修复」快捷方式，
         图标使用本目录 icon\HearthstoneFix.ico；已存在则不动。
 #>
@@ -44,6 +45,7 @@ param(
     [switch]$TestClick,
     [switch]$KeepConsole,
     [switch]$NoShortcut,
+    [switch]$DiagOnly,
     [string]$SimKeys = '',
     [int]$KeepDays = 3,
     [int]$LaunchTimeout = 120
@@ -62,7 +64,8 @@ if ($SimKeys) {
 }
 
 $ScriptDir = Split-Path -Parent $PSCommandPath
-$script:LogFile = Join-Path $ScriptDir 'hs-fix-log.txt'
+# 诊断模式写独立日志，避免把上一次真跑（或这次真跑）的日志覆盖掉，两份可以对照着看
+$script:LogFile = Join-Path $ScriptDir $(if ($DiagOnly) { 'hs-diag-log.txt' } else { 'hs-fix-log.txt' })
 try { if (Test-Path -LiteralPath $script:LogFile) { Remove-Item -LiteralPath $script:LogFile -Force -ErrorAction Stop } } catch {}
 function Log($m) {
     Write-Host $m
@@ -373,8 +376,115 @@ function Test-GameAlive {
     return [bool](@($ps | Where-Object { $_.Mem -ge (20MB) -or $_.HasWindow }).Count -gt 0)
 }
 function Get-ZombieGame {
-    return @(Get-GameProcs | Where-Object { $_.Mem -lt (20MB) -and -not $_.HasWindow })
+    # 真正的「卡死残留」有两种形态，判据不能只看内存大小：
+    #   A. 线程已被清空（Threads=0）但进程对象仍不释放（HasExited=False）—— TerminateProcess 已是空转，
+    #      内核里还有人引用这个进程对象，所以杀不掉。常见于闪退后残留的启动子进程。
+    #   B. 内存极小且没有窗口 —— 老判据，保留兜底。
+    $out = @()
+    foreach ($n in @('Hearthstone', 'Hearthstone_x64')) {
+        foreach ($p in @(Get-Process -Name $n -ErrorAction SilentlyContinue)) {
+            $t = -1; $hx = $null; $mem = 0; $win = $false
+            try { $t = @($p.Threads).Count } catch {}
+            try { $hx = $p.HasExited } catch {}
+            try { $mem = [int64]$p.WorkingSet64 } catch {}
+            try { $win = ($p.MainWindowHandle -ne 0) } catch {}
+            if ($hx -eq $true) { continue }
+            $hit = ($t -eq 0) -or ($mem -lt 20MB -and -not $win)
+            if ($hit) {
+                $out += [pscustomobject]@{ Pid = $p.Id; Name = $n; Mem = $mem; HasWindow = $win; Threads = $t; HasExited = $hx }
+            }
+        }
+    }
+    return @($out)
 }
+# 第一步杀完之后仍然活着的炉石进程，一律算卡死残留（不再按内存大小筛，2GB 卡死的也算）
+function Get-StuckGame {
+    return @(Get-GameProcs)
+}
+
+function Get-ProcParent([int]$TargetPid) {
+    try {
+        $c = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $TargetPid) -ErrorAction Stop
+        if ($c) { return [int]$c.ParentProcessId }
+    } catch {}
+    return 0
+}
+
+# ================= 卡死诊断（只读采集，不改任何状态） =================
+# 卡死时最有价值的三组证据：线程在等什么（WaitReason）、内核时间还涨不涨、进程里有没有第三方注入的模块
+function Get-ThreadWaitSummary($Proc) {
+    if (-not $Proc) { return '' }
+    try {
+        $g = @($Proc.Threads | Group-Object -Property {
+                $st = ''; $wr = ''
+                try { $st = [string]$_.ThreadState } catch {}
+                try { $wr = [string]$_.WaitReason } catch {}
+                if (-not $st) { $st = '?' }
+                if (-not $wr) { $wr = '?' }
+                $st + '/' + $wr
+            } | Sort-Object Count -Descending | Select-Object -First 4)
+        return (($g | ForEach-Object { $_.Name + '×' + $_.Count }) -join ', ')
+    } catch { return '（线程信息不可读）' }
+}
+
+function Get-ProcSnapshot([int]$TargetPid) {
+    $p = Get-Process -Id $TargetPid -ErrorAction SilentlyContinue
+    if (-not $p) { return $null }
+    $o = [pscustomobject]@{
+        Pid = $TargetPid; Name = $p.ProcessName; Mem = [int64]0
+        Threads = 0; Handles = 0; Responding = '?'; HasExited = ''
+        KernelTime = [double]-1; UserTime = [double]-1
+        StartTime = ''; Path = ''; Waits = ''
+    }
+    try { $o.HasExited = [string]$p.HasExited } catch { $o.HasExited = '不可读' }
+    try { $o.Mem = [int64]$p.WorkingSet64 } catch {}
+    try { $o.Threads = @($p.Threads).Count } catch {}
+    try { $o.Handles = $p.HandleCount } catch {}
+    try {
+        if ($p.MainWindowHandle -ne 0) { $o.Responding = [string]$p.Responding } else { $o.Responding = '无窗口' }
+    } catch { $o.Responding = '?' }
+    try { $o.KernelTime = [math]::Round([double]$p.PrivilegedProcessorTime.TotalSeconds, 3) } catch {}
+    try { $o.UserTime = [math]::Round([double]$p.UserProcessorTime.TotalSeconds, 3) } catch {}
+    try { $o.StartTime = $p.StartTime.ToString('MM-dd HH:mm:ss') } catch {}
+    try { $o.Path = $p.Path } catch {}
+    $o.Waits = Get-ThreadWaitSummary $p
+    return $o
+}
+
+# 只在「Windows 目录之外」+「进程自己目录之外」的模块 = 真正被第三方注入进来的
+function Get-NonSystemModules([int]$TargetPid) {
+    $p = Get-Process -Id $TargetPid -ErrorAction SilentlyContinue
+    if (-not $p) { return @() }
+    $ownDir = ''
+    try { if ($p.Path) { $ownDir = (Split-Path -Parent $p.Path) } } catch {}
+    try {
+        return @($p.Modules | Where-Object {
+                $f = $_.FileName
+                if (-not $f) { return $false }
+                if ($f -match '(?i)^[A-Z]:\\Windows\\') { return $false }
+                if ($ownDir -and ((Split-Path -Parent $f) -eq $ownDir)) { return $false }
+                return $true
+            } | ForEach-Object { $_.ModuleName } | Sort-Object -Unique | Select-Object -First 40)
+    } catch { return @('（模块读取失败：' + $_.Exception.Message + '）') }
+}
+
+# 一条进程的完整画像，含"内核时间还涨不涨"的冻结判定
+function Write-ProcReport([int]$TargetPid, [string]$Tag) {
+    $s = Get-ProcSnapshot $TargetPid
+    if (-not $s) { return }
+    Log ('  [{0}] {1} PID={2} 内存={3} 线程={4} 句柄={5} 响应={6}' -f $Tag, $s.Name, $s.Pid, (Human $s.Mem), $s.Threads, $s.Handles, $s.Responding)
+    Log ('          启动={0} 内核时间={1}s 用户时间={2}s' -f $s.StartTime, $s.KernelTime, $s.UserTime)
+    if ($s.Path) { Log ('          路径=' + $s.Path) }
+    if ($s.Waits) { Log ('          线程等待分布=' + $s.Waits) }
+    Start-Sleep -Milliseconds 1200
+    $s2 = Get-ProcSnapshot $TargetPid
+    if ($s2) {
+        $d = [math]::Round(($s2.KernelTime + $s2.UserTime) - ($s.KernelTime + $s.UserTime), 3)
+        if ($d -le 0.05) { Log '          活动度=1.2 秒内无 CPU 消耗（可能空闲等待，也可能卡死，要结合上面线程等待看）' }
+        else { Log ('          活动度=1.2 秒内消耗 {0}s CPU（仍在跑）' -f $d) }
+    }
+}
+
 # 用 SYSTEM 身份的临时计划任务去 taskkill：内核挂起的进程有时只有 SYSTEM 能收掉
 function Invoke-SystemKill([int[]]$TargetPids) {
     $list = @($TargetPids | Where-Object { $_ -gt 0 })
@@ -406,7 +516,13 @@ function Invoke-SystemKill([int[]]$TargetPids) {
         & $schtasksExe /Delete /TN $tn /F 2>&1 | Out-Null
     }
     Start-Sleep -Seconds 2
-    $left = @(Get-ZombieGame | Where-Object { $list -contains $_.Pid })
+    $left = @(Get-StuckGame | Where-Object { $list -contains $_.Pid })
+    if ($left.Count -gt 0) {
+        foreach ($lp in $left) {
+            $s = Get-ProcSnapshot $lp.Pid
+            if ($s) { Log ('  [SYSTEM 强杀] PID {0} 仍存活：线程={1} 句柄={2} 内核时间={3}s 等待={4}' -f $s.Pid, $s.Threads, $s.Handles, $s.KernelTime, $s.Waits) }
+        }
+    }
     return ($left.Count -eq 0)
 }
 
@@ -698,6 +814,27 @@ function Invoke-BnEnterGame([int]$WaitSec = 20, [int]$Retry = 3) {
     return $false
 }
 
+# 读最近的崩溃事件，判断是哪一种崩法——它直接决定"杀不掉"是不是必然结果
+function Get-LastCrash([int]$Minutes = 360) {
+    try {
+        $ev = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Id = 1000; StartTime = (Get-Date).AddMinutes(-$Minutes) } -ErrorAction Stop |
+              Where-Object { $_.Message -match 'Hearthstone\.exe' } | Select-Object -First 1
+        if (-not $ev) { return $null }
+        $m = $ev.Message
+        $mod = ''; $code = ''
+        if ($m -match '(?:错误模块名称|Faulting module name)[:：]\s*([^\s,，]+)') { $mod = $matches[1] }
+        if ($m -match '(?:异常代码|Exception code)[:：]\s*(0x[0-9a-fA-F]+)') { $code = $matches[1] }
+        $mean = ''
+        switch ($code) {
+            '0xc0000374' { $mean = '堆损坏（HEAP_CORRUPTION）：进程退出时清理堆会自己卡死，所以怎么杀都杀不掉，这是必然' }
+            '0xc0000005' { $mean = '访问违例（ACCESS_VIOLATION）：多半是注入进游戏的叠加层/记牌器踩了野指针' }
+            '0xc0000409' { $mean = '快速失败（栈保护或安全 cookie 被破坏）' }
+            default { if ($code) { $mean = '异常码 ' + $code } }
+        }
+        return [pscustomobject]@{ Time = $ev.TimeCreated; Module = $mod; Code = $code; Mean = $mean }
+    } catch { return $null }
+}
+
 function Show-CrashEvidence {
     $log = "$env:USERPROFILE\AppData\LocalLow\Blizzard Entertainment\Hearthstone\Player.log"
     if (Test-Path -LiteralPath $log) {
@@ -790,7 +927,7 @@ function Invoke-RebootAsk([int]$Countdown = 8) {
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 Log ('模式: ' + $(if ($DryRun) { '预览' } else { '执行' }) + '   管理员: ' + $(if ($isAdmin) { '有' } else { '无' }))
 Log ''
-if (-not $DryRun -and -not $NoShortcut) { $null = Ensure-Shortcut }
+if (-not $DryRun -and -not $NoShortcut -and -not $DiagOnly) { $null = Ensure-Shortcut }
 
 if ($TestReboot) {
     Log '=== 测试模式：仅验证按键与重启询问 ==='
@@ -805,46 +942,174 @@ if ($TestClick) {
     Finish 0
 }
 
+# ---------- 0. 诊断模式 ----------
+if ($DiagOnly) {
+    Log '=== 诊断模式：只采集现场，不结束任何进程、不启动任何程序 ==='
+    $probe = @()
+    foreach ($n in @('Hearthstone', 'Hearthstone_x64', 'Battle.net', 'Battle.net Helper', 'Agent', 'BlizzardBrowser', 'HSAng')) {
+        $probe += @(Get-Process -Name $n -ErrorAction SilentlyContinue)
+    }
+    if (@($probe).Count -eq 0) {
+        Log '  当前没有相关进程在跑（游戏没开，或已经退干净了）。'
+        Log '=== 诊断结束 ==='
+        Finish 0
+    }
+    $parentMap = @{}
+    try {
+        Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object {
+            $parentMap[[int]$_.ProcessId] = [pscustomobject]@{ Parent = [int]$_.ParentProcessId; Cmd = $_.CommandLine }
+        }
+    } catch {}
+    foreach ($p in @($probe)) {
+        Write-ProcReport $p.Id '现场'
+        if ($parentMap.ContainsKey([int]$p.Id)) {
+            $ln = $parentMap[[int]$p.Id]
+            if ($parentMap.ContainsKey($ln.Parent)) { Log ('          父进程PID=' + $ln.Parent + '（仍在）') }
+            else { Log ('          父进程PID=' + $ln.Parent + '（已退出）') }
+            if ($ln.Cmd) { Log ('          命令行=' + $ln.Cmd) }
+        }
+        $mods = Get-NonSystemModules $p.Id
+        if (@($mods).Count -gt 0) { Log ('          非系统模块(' + @($mods).Count + ')=' + ($mods -join ', ')) }
+    }
+    Log ''
+    Log '=== 诊断结束：未结束任何进程，直接把 hs-fix-log.txt 拿来分析即可 ==='
+    Finish 0
+}
+
 # ---------- 1. 结束残留进程 ----------
 Log '=== 1/5 结束残留进程 ==='
-$names = @('Hearthstone', 'Hearthstone_x64', 'Battle.net', 'Battle.net Helper', 'Agent', 'BlizzardBrowser', 'BlizzardError')
-if (-not $KeepBox) { $names += 'HSAng' }
-$all = Get-Process -ErrorAction SilentlyContinue
+
+# 顺序很关键：先把「注入方」退干净，最后才退被注入的炉石。
+# 炉石盒子（HSAng）会把 DLL 注入进炉石进程；注入方先死、钩子先解，被注入方才有可能从等待里出来。
+# 反过来先杀炉石，等于把还在等注入方的线程直接钉死，之后再怎么提权也收不掉。
+$groups = @()
+if (-not $KeepBox) { $groups += ,@('HSAng') }
+$groups += ,@('BlizzardBrowser', 'BlizzardError')
+$groups += ,@('Battle.net Helper')
+$groups += ,@('Agent')
+$groups += ,@('Battle.net')
+$groups += ,@('Hearthstone', 'Hearthstone_x64')
+
 $killed = 0
-foreach ($n in $names) {
-    foreach ($p in @($all | Where-Object { $_.ProcessName -eq $n })) {
-        if ($DryRun) { Log ('  [预览] 结束 {0} PID={1}' -f $n, $p.Id) }
-        else {
-            try { Stop-Process -Id $p.Id -Force -ErrorAction Stop; $killed++; Log ('  [已结束] {0} PID={1}' -f $n, $p.Id) }
-            catch { Log ('  [跳过] {0} PID={1}' -f $n, $p.Id) }
+$script:BypassBn = $false
+$gi = 0
+foreach ($g in $groups) {
+    $gi++
+    $targets = @()
+    foreach ($n in $g) { $targets += @(Get-Process -Name $n -ErrorAction SilentlyContinue) }
+    if (@($targets).Count -eq 0) { continue }
+    # 组内按内存从大到小处理：真正在跑的游戏（父进程、大内存）先死，它留下的空壳子进程才有机会被连带回收
+    $targets = @($targets | Sort-Object -Property { try { [int64]$_.WorkingSet64 } catch { [int64]0 } } -Descending)
+    Log ('  -- 第 {0}/{1} 步：{2} --' -f $gi, @($groups).Count, (@($g) -join ' / '))
+
+    foreach ($p in @($targets)) {
+        $tp = $p.Id
+        $bp = Get-ProcSnapshot $tp
+        if (-not $bp) { continue }
+        Log ('     [处理] {0} PID={1} 内存={2} 线程={3} 内核时间={4}s 等待={5}' -f $bp.Name, $tp, (Human $bp.Mem), $bp.Threads, $bp.KernelTime, $bp.Waits)
+
+        if ($DryRun) { Log '           （预览，不实际结束）'; continue }
+
+        try { Stop-Process -Id $tp -Force -ErrorAction Stop }
+        catch { Log ('           [结束请求被拒] ' + $_.Exception.Message) }
+
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $gone = $false
+        while ($sw.Elapsed.TotalSeconds -lt 5) {
+            if (-not (Get-Process -Id $tp -ErrorAction SilentlyContinue)) { $gone = $true; break }
+            Start-Sleep -Milliseconds 250
         }
+        if ($gone) {
+            $killed++
+            Log ('           [已结束] 用时 {0:N2}s' -f $sw.Elapsed.TotalSeconds)
+        } else {
+            $ap = Get-ProcSnapshot $tp
+            Log '           [未结束] 5 秒内仍存活'
+            if ($ap) { Log ('                    残留：线程={0} 句柄={1} 内核时间={2}s 等待={3}' -f $ap.Threads, $ap.Handles, $ap.KernelTime, $ap.Waits) }
+        }
+    }
+
+    if (-not $DryRun) {
+        if (@($g) -contains 'HSAng') {
+            # 盒子退完后单独观察炉石：如果此时炉石的线程等待状态松了，就说明"注入方先行"这条思路对路
+            Start-Sleep -Milliseconds 1500
+            foreach ($hp in @(Get-Process -Name 'Hearthstone', 'Hearthstone_x64' -ErrorAction SilentlyContinue)) {
+                $hs = Get-ProcSnapshot $hp.Id
+                if ($hs) { Log ('     [观察] 盒子退出后炉石 PID={0}：线程={1} 内核时间={2}s 等待={3}' -f $hs.Pid, $hs.Threads, $hs.KernelTime, $hs.Waits) }
+            }
+        }
+        elseif (-not (@($g) -contains 'Hearthstone')) { Start-Sleep -Milliseconds 800 }
     }
 }
 if (-not $DryRun -and $killed -eq 0) { Log '  没有需要结束的进程' }
 
-# ---------- 1.5 僵尸进程 ----------
-$zombies = Get-ZombieGame
+# ---------- 1.5 卡死残留（含第 1 步没杀掉的） ----------
+if ($DryRun) { $zombies = @(Get-ZombieGame) } else { $zombies = @(Get-StuckGame) }
+# 先看崩溃事件：如果是堆损坏，"杀不掉"就是必然结果，直接决定后面走绕过而不是硬杀
+$crash = if ($DryRun) { $null } else { Get-LastCrash }
+$heapCrash = $false
+if ($crash) {
+    Log ('  最近一次崩溃：{0}  模块={1}  代码={2}' -f $crash.Time.ToString('MM-dd HH:mm:ss'), $crash.Module, $crash.Code)
+    if ($crash.Mean) { Log ('               ' + $crash.Mean) }
+    if ($crash.Code -eq '0xc0000374') { $heapCrash = $true }
+}
 if (@($zombies).Count -gt 0) {
-    Log ('  发现卡死的炉石残留: ' + (@($zombies | ForEach-Object { 'PID=' + $_.Pid + '(' + [int]($_.Mem / 1KB) + 'KB)' }) -join ' '))
+    Log ('  卡死残留：' + (@($zombies | ForEach-Object { 'PID=' + $_.Pid + '(' + [int]($_.Mem / 1KB) + 'KB)' }) -join ' '))
+    foreach ($z in @($zombies)) {
+        $s = Get-ProcSnapshot $z.Pid
+        if ($s) {
+            Log ('    [卡死画像] PID={0} 线程={1} 句柄={2} 已退出={3} 内核时间={4}s 等待={5}' -f $s.Pid, $s.Threads, $s.Handles, $s.HasExited, $s.KernelTime, $s.Waits)
+            $par = Get-ProcParent $z.Pid
+            if ($par -gt 0) {
+                $pp = Get-Process -Id $par -ErrorAction SilentlyContinue
+                if ($pp) { Log ('               父进程 PID={0}（{1}，仍在跑）' -f $par, $pp.ProcessName) }
+                else { Log ('               父进程 PID={0}（已退出）' -f $par) }
+            }
+            $mods = Get-NonSystemModules $z.Pid
+            if (@($mods).Count -gt 0) { Log ('               非系统模块(' + @($mods).Count + ')=' + ($mods -join ', ')) }
+        }
+    }
+    $shellOnly = (@($zombies).Count -gt 0 -and @($zombies | Where-Object { $_.HasExited -eq $true }).Count -eq @($zombies).Count)
     if (-not $DryRun) {
-        Kill-Game; Start-Sleep -Seconds 2; $zombies = Get-ZombieGame
+        Kill-Game; Start-Sleep -Seconds 2; $zombies = @(Get-StuckGame)
+        $shellOnly = (@($zombies).Count -gt 0 -and @($zombies | Where-Object { $_.HasExited -eq $true }).Count -eq @($zombies).Count)
         if (@($zombies).Count -gt 0) {
-            Log '  普通结束无效，改用 SYSTEM 身份再试一次（这一步不重启也有机会清掉）...'
-            $null = Invoke-SystemKill @($zombies | ForEach-Object { $_.Pid })
-            $zombies = Get-ZombieGame
-            if (@($zombies).Count -eq 0) { Log '  [已清除] SYSTEM 强杀成功，无需重启，继续自动启动。' }
+            if ($shellOnly) {
+                Log '  这些是已终止的空壳（HasExited=True）：终止请求对它们本来就是空转，跳过 SYSTEM 强杀。'
+                if ($heapCrash) { Log '  崩溃码是 0xc0000374 堆损坏：进程退出时清理堆会自己卡死，用户态没有手段把它推完，只能绕过。' }
+            } else {
+                Log '  普通结束无效，改用 SYSTEM 身份再试一次（这一步不重启也有机会清掉）...'
+                $null = Invoke-SystemKill @($zombies | ForEach-Object { $_.Pid })
+                $zombies = @(Get-StuckGame)
+                if (@($zombies).Count -eq 0) { Log '  [已清除] SYSTEM 强杀成功，无需重启，继续自动启动。' }
+            }
+        } else {
+            Log '  [已清除] 再杀一次就干净了。'
         }
     }
     if (@($zombies).Count -gt 0) {
-        Log '  [阻断] 这些进程卡死在内核里，普通结束和提权结束都无效（Access denied）。'
-        Log '         它们会让战网一直显示"正在游戏中"，从而导致游戏无法被自动拉起。'
-        if (-not $NoLaunch -and -not $DryRun) {
-            $rb = Invoke-RebootAsk 8
-            if ($rb -eq 'ok') { Log '  系统即将重启，重启后重新双击「一键修复」即可全自动。'; Finish 0 }
-            elseif ($rb -eq 'cancel') { Log ''; Log '=== 已取消：未重启，按需再双击运行 ==='; Finish 2 }
-            else { Log ''; Log '=== 自动重启失败：请手动重启电脑后重试 ==='; Finish 3 }
+        Log '  [阻断] 上面的进程仍然活着：普通结束、提权结束、SYSTEM 身份都收不掉。'
+        if ($shellOnly) {
+            Log '  [判别] 它们是「已终止但内核对象未回收」的空壳：线程=0 且 HasExited=True。'
+            Log '         杀是空转（不是权限问题），但它们的互斥体/文件锁在终止那一刻已释放，游戏自己不会再拦。'
+            Log '         真正拦路的只是战网客户端的「正在游戏中」判断。'
+            if (-not $NoLaunch -and -not $DryRun) {
+                Log '  [降级] 先不重启：改走「绕过战网、直接启动游戏主程序」。'
+                $script:BypassBn = $true
+            } else {
+                Log '         >>> （预览或 -NoLaunch）真实执行时会走绕过战网直接启动的降级路线。'
+            }
         } else {
-            Log '         >>> （预览模式）实际执行时会尝试 SYSTEM 强杀，仍失败才提示按键重启。'
+            Log '  [判别] 有进程尚未真正退出（HasExited=False 或线程仍在），属于内核态等待卡死。'
+            Log '         若父进程仍在跑，先结束父进程再等 2 秒；父进程也没了就只能重启。'
+            if (-not $NoLaunch -and -not $DryRun) {
+                $rb = Invoke-RebootAsk 8
+                if ($rb -eq 'ok') { Log '  系统即将重启，重启后重新双击「一键修复」即可全自动。'; Finish 0 }
+                elseif ($rb -eq 'cancel') { Log ''; Log '=== 已取消：未重启，按需再双击运行 ==='; Finish 2 }
+                else { Log ''; Log '=== 自动重启失败：请手动重启电脑后重试 ==='; Finish 3 }
+            } else {
+                Log '         >>> （预览模式）实际执行时会尝试 SYSTEM 强杀，仍失败才提示按键重启。'
+            }
         }
     }
 }
@@ -972,19 +1237,27 @@ function Start-All {
     $launched = Test-GameAlive
     if ($launched) { Log '  游戏已在运行' }
     if (-not $launched) {
-        Log '  方式1: 识别战网界面并点击「进入游戏」'
-        if (Invoke-BnEnterGame 25 3) { $launched = $true; Log '  [成功] 点击「进入游戏」后游戏已启动' }
-        else { Log '  点击未成功，改用兜底方式' }
+        if ($script:BypassBn) {
+            Log '  [降级] 战网此时必然一直显示"正在游戏中"，跳过界面点击，直接启动游戏主程序'
+        } else {
+            Log '  方式1: 识别战网界面并点击「进入游戏」'
+            if (Invoke-BnEnterGame 25 3) { $launched = $true; Log '  [成功] 点击「进入游戏」后游戏已启动' }
+            else { Log '  点击未成功，改用兜底方式' }
+        }
     }
     if (-not $launched) {
-        $tries = @(
+        $exeTries = @(
+            @{ Kind = 'exe'; Value = $cfg.GameExe;         Desc = '直接启动游戏主程序（绕过战网）' },
+            @{ Kind = 'exe'; Value = $cfg.GameLauncherExe; Desc = '炉石独立启动器' }
+        )
+        $bnTries = @(
             @{ Kind = 'arg'; Value = ('--uid=' + $cfg.GameUid);          Desc = ('战网 --uid=' + $cfg.GameUid) },
             @{ Kind = 'uri'; Value = ('battlenet://' + $cfg.GameUid);    Desc = ('战网 URI battlenet://' + $cfg.GameUid) },
             @{ Kind = 'arg'; Value = ('--uid=' + $cfg.GameUidAlt);       Desc = ('战网 --uid=' + $cfg.GameUidAlt) },
-            @{ Kind = 'uri'; Value = ('battlenet://' + $cfg.GameUidAlt); Desc = ('战网 URI battlenet://' + $cfg.GameUidAlt) },
-            @{ Kind = 'exe'; Value = $cfg.GameLauncherExe;              Desc = '直接启动炉石独立启动器' },
-            @{ Kind = 'exe'; Value = $cfg.GameExe;                       Desc = '直接启动游戏主程序（可能被战网判为未授权而闪退）' }
+            @{ Kind = 'uri'; Value = ('battlenet://' + $cfg.GameUidAlt); Desc = ('战网 URI battlenet://' + $cfg.GameUidAlt) }
         )
+        # 降级模式下把"直接启动游戏"提到最前：战网已经被空壳挡住，先试不经过战网的路
+        if ($script:BypassBn) { $tries = @($exeTries) + @($bnTries) } else { $tries = @($bnTries) + @($exeTries) }
         foreach ($t in $tries) {
             if (Test-GameAlive) { $launched = $true; break }
             Log ('  兜底尝试: ' + $t.Desc)
@@ -1074,6 +1347,15 @@ elseif ($DryRun) {
     else {
         Log ''; Log '=== 启动未成功，请查看上方诊断信息 ==='
         Show-CrashEvidence
+        if ($script:BypassBn) {
+            Log ''
+            Log '  绕过战网直接启动也没能进游戏，剩下只有重启能清掉那两个空壳。'
+            Log '  （如果你看到的是"请通过战网启动"之类提示，说明这条路对当前版本不成立，请告诉我）'
+            $rb = Invoke-RebootAsk 8
+            if ($rb -eq 'ok') { Log '  系统即将重启，重启后重新双击「一键修复」即可全自动。'; Finish 0 }
+            elseif ($rb -eq 'cancel') { Log ''; Log '=== 已取消：未重启 ==='; Finish 2 }
+            else { Log ''; Log '=== 自动重启失败：请手动重启电脑后重试 ==='; Finish 3 }
+        }
         Finish 1
     }
 }
